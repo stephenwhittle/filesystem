@@ -1243,6 +1243,17 @@ enum class portable_error {
 GHC_FS_API std::error_code make_error_code(portable_error err);
 #ifdef GHC_OS_WINDOWS
 GHC_FS_API std::error_code make_system_error(uint32_t err = 0);
+
+template <typename Fn, Fn fn, typename... Args>
+typename std::result_of<Fn(Args...)>::type wrapper(std::error_code& ec, Args... args)
+{
+    typename std::result_of<Fn(Args...)>::type RetVal;
+    RetVal = fn(std::forward<Args>(args)...);
+    ec = make_system_error(GetLastError());
+    return RetVal;
+}
+#define PROTECT_LASTERROR(FUNC) ghc::filesystem::detail::wrapper<decltype(&FUNC), &FUNC>
+
 #else
 GHC_FS_API std::error_code make_system_error(int err = 0);
 #endif
@@ -1775,12 +1786,18 @@ GHC_INLINE void create_symlink(const path& target_name, const path& new_symlink,
 #pragma GCC diagnostic pop
 #endif
     if (api_call) {
-        if (api_call(detail::fromUtf8<std::wstring>(new_symlink.u8string()).c_str(), detail::fromUtf8<std::wstring>(target_name.u8string()).c_str(), to_directory ? 1 : 0) == 0) {
-            auto result = ::GetLastError();
-            if (result == ERROR_PRIVILEGE_NOT_HELD && api_call(detail::fromUtf8<std::wstring>(new_symlink.u8string()).c_str(), detail::fromUtf8<std::wstring>(target_name.u8string()).c_str(), to_directory ? 3 : 2) != 0) {
-                return;
+        if (PROTECT_LASTERROR(CreateSymbolicLinkW)(ec, detail::fromUtf8<std::wstring>(new_symlink.u8string()).c_str(), detail::fromUtf8<std::wstring>(target_name.u8string()).c_str(), to_directory ? 1 : 0) == 0) {
+            
+            if (ec.value() == ERROR_PRIVILEGE_NOT_HELD) {
+                if (PROTECT_LASTERROR(CreateSymbolicLinkW)(ec, detail::fromUtf8<std::wstring>(new_symlink.u8string()).c_str(), detail::fromUtf8<std::wstring>(target_name.u8string()).c_str(), to_directory ? 3 : 2) != 0) {
+                    ec.clear();
+                    return;
+                }
             }
-            ec = detail::make_system_error(result);
+
+        }
+        else {
+            ec.clear();
         }
     }
     else {
@@ -2028,10 +2045,8 @@ GHC_INLINE file_status symlink_status_ex(const path& p, std::error_code& ec, uin
 #ifdef GHC_OS_WINDOWS
     file_status fs;
     WIN32_FILE_ATTRIBUTE_DATA attr;
-    if (!GetFileAttributesExW(detail::fromUtf8<std::wstring>(p.u8string()).c_str(), GetFileExInfoStandard, &attr)) {
-        ec = detail::make_system_error();
-    }
-    else {
+    if (PROTECT_LASTERROR(GetFileAttributesExW)(ec, detail::fromUtf8<std::wstring>(p.u8string()).c_str(), GetFileExInfoStandard, &attr))
+    {
         ec.clear();
         fs = detail::status_from_INFO(p, &attr, ec, sz, lwt);
         if (nhl) {
@@ -2073,19 +2088,19 @@ GHC_INLINE file_status status_ex(const path& p, std::error_code& ec, file_status
         return file_status(file_type::unknown);
     }
     WIN32_FILE_ATTRIBUTE_DATA attr;
-    if (!::GetFileAttributesExW(p.wstring().c_str(), GetFileExInfoStandard, &attr)) {
-        ec = detail::make_system_error();
-    }
-    else if (attr.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-        path target = resolveSymlink(p, ec);
-        file_status result;
-        if (!ec && !target.empty()) {
-            if (sls) {
-                *sls = status_from_INFO(p, &attr, ec);
+    if (PROTECT_LASTERROR(GetFileAttributesExW)(ec, p.wstring().c_str(), GetFileExInfoStandard, &attr)) {
+        ec.clear();
+        if (attr.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            path target = resolveSymlink(p, ec);
+            file_status result;
+            if (!ec && !target.empty()) {
+                if (sls) {
+                    *sls = status_from_INFO(p, &attr, ec);
+                }
+                return detail::status_ex(target, ec, nullptr, sz, nhl, lwt, recurse_count + 1);
             }
-            return detail::status_ex(target, ec, nullptr, sz, nhl, lwt, recurse_count + 1);
+            return file_status(file_type::unknown);
         }
-        return file_status(file_type::unknown);
     }
     if (ec) {
         if (detail::is_not_found_error(ec)) {
@@ -2097,6 +2112,7 @@ GHC_INLINE file_status status_ex(const path& p, std::error_code& ec, file_status
         *nhl = 0;
     }
     return detail::status_from_INFO(p, &attr, ec, sz, lwt);
+    
 #else
     (void)recurse_count;
     struct ::stat st;
@@ -3221,11 +3237,13 @@ GHC_INLINE path absolute(const path& p, std::error_code& ec)
     if (p.empty()) {
         return absolute(current_path(ec), ec) / "";
     }
-    ULONG size = ::GetFullPathNameW(p.wstring().c_str(), 0, 0, 0);
+    ULONG size = PROTECT_LASTERROR(::GetFullPathNameW)(ec, p.wstring().c_str(), 0, nullptr, nullptr);
     if (size) {
+        ec.clear();
         std::vector<wchar_t> buf(size, 0);
-        ULONG s2 = GetFullPathNameW(p.wstring().c_str(), size, buf.data(), nullptr);
+        ULONG s2 = PROTECT_LASTERROR(::GetFullPathNameW)(ec, p.wstring().c_str(), size, buf.data(), nullptr);
         if (s2 && s2 < size) {
+            ec.clear();
             path result = path(std::wstring(buf.data(), s2));
             if (p.filename() == ".") {
                 result /= ".";
@@ -3495,9 +3513,11 @@ GHC_INLINE bool copy_file(const path& from, const path& to, copy_options options
         overwrite = true;
     }
 #ifdef GHC_OS_WINDOWS
-    if (!::CopyFileW(detail::fromUtf8<std::wstring>(from.u8string()).c_str(), detail::fromUtf8<std::wstring>(to.u8string()).c_str(), !overwrite)) {
-        ec = detail::make_system_error();
+    if (!PROTECT_LASTERROR(::CopyFileW)(ec, detail::fromUtf8<std::wstring>(from.u8string()).c_str(), detail::fromUtf8<std::wstring>(to.u8string()).c_str(), !overwrite)) {
         return false;
+    }
+    else {
+        ec.clear();
     }
     return true;
 #else
@@ -3654,14 +3674,20 @@ GHC_INLINE bool create_directory(const path& p, const path& attributes, std::err
 #endif
 #ifdef GHC_OS_WINDOWS
     if (!attributes.empty()) {
-        if (!::CreateDirectoryExW(detail::fromUtf8<std::wstring>(attributes.u8string()).c_str(), detail::fromUtf8<std::wstring>(p.u8string()).c_str(), NULL)) {
-            ec = detail::make_system_error();
+        if (!PROTECT_LASTERROR(::CreateDirectoryExW)(ec, detail::fromUtf8<std::wstring>(attributes.u8string()).c_str(), detail::fromUtf8<std::wstring>(p.u8string()).c_str(), nullptr)) {
             return false;
         }
+        else
+        {
+            ec.clear();
+        }
     }
-    else if (!::CreateDirectoryW(detail::fromUtf8<std::wstring>(p.u8string()).c_str(), NULL)) {
-        ec = detail::make_system_error();
+    else if (!PROTECT_LASTERROR(::CreateDirectoryW)(ec, detail::fromUtf8<std::wstring>(p.u8string()).c_str(), nullptr)) {
         return false;
+    }
+    else
+    {
+        ec.clear();
     }
 #else
     ::mode_t attribs = static_cast<mode_t>(perms::all);
@@ -3745,11 +3771,14 @@ GHC_INLINE path current_path(std::error_code& ec)
 {
     ec.clear();
 #ifdef GHC_OS_WINDOWS
-    DWORD pathlen = ::GetCurrentDirectoryW(0, 0);
+    DWORD pathlen = PROTECT_LASTERROR(::GetCurrentDirectoryW)(ec,0, nullptr);
     std::unique_ptr<wchar_t[]> buffer(new wchar_t[size_t(pathlen) + 1]);
-    if (::GetCurrentDirectoryW(pathlen, buffer.get()) == 0) {
-        ec = detail::make_system_error();
+    if (PROTECT_LASTERROR(::GetCurrentDirectoryW)(ec, pathlen, buffer.get()) == 0) {
         return path();
+    }
+    else
+    {
+        ec.clear();
     }
     return path(std::wstring(buffer.get()), path::native_format);
 #else
@@ -3778,8 +3807,8 @@ GHC_INLINE void current_path(const path& p, std::error_code& ec) noexcept
 {
     ec.clear();
 #ifdef GHC_OS_WINDOWS
-    if (!::SetCurrentDirectoryW(detail::fromUtf8<std::wstring>(p.u8string()).c_str())) {
-        ec = detail::make_system_error();
+    if (PROTECT_LASTERROR(::SetCurrentDirectoryW)(ec,detail::fromUtf8<std::wstring>(p.u8string()).c_str())) {
+        ec.clear();
     }
 #else
     if (::chdir(p.string().c_str()) == -1) {
@@ -3825,15 +3854,20 @@ GHC_INLINE bool equivalent(const path& p1, const path& p2, std::error_code& ec) 
 {
     ec.clear();
 #ifdef GHC_OS_WINDOWS
-    std::shared_ptr<void> file1(::CreateFileW(p1.wstring().c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0), CloseHandle);
-    auto e1 = ::GetLastError();
-    std::shared_ptr<void> file2(::CreateFileW(p2.wstring().c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0), CloseHandle);
+    std::shared_ptr<void> file1(PROTECT_LASTERROR(::CreateFileW)(ec, p1.wstring().c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr), CloseHandle);
+    auto e1 = ec.value();
+    ec.clear();
+
+    std::shared_ptr<void> file2(PROTECT_LASTERROR(::CreateFileW)(ec, p2.wstring().c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr), CloseHandle);
+    auto e2 = ec.value();
+    ec.clear();
+
     if (file1.get() == INVALID_HANDLE_VALUE || file2.get() == INVALID_HANDLE_VALUE) {
 #ifdef LWG_2937_BEHAVIOUR
-        ec = detail::make_system_error(e1 ? e1 : ::GetLastError());
+        ec = detail::make_system_error(e1 ? e1 : e2);
 #else
         if (file1 == file2) {
-            ec = detail::make_system_error(e1 ? e1 : ::GetLastError());
+            ec = detail::make_system_error(e1 ? e1 : e2);
         }
 #endif
         return false;
@@ -3885,10 +3919,10 @@ GHC_INLINE uintmax_t file_size(const path& p, std::error_code& ec) noexcept
     ec.clear();
 #ifdef GHC_OS_WINDOWS
     WIN32_FILE_ATTRIBUTE_DATA attr;
-    if (!GetFileAttributesExW(detail::fromUtf8<std::wstring>(p.u8string()).c_str(), GetFileExInfoStandard, &attr)) {
-        ec = detail::make_system_error();
+    if (!PROTECT_LASTERROR(GetFileAttributesExW)(ec, detail::fromUtf8<std::wstring>(p.u8string()).c_str(), GetFileExInfoStandard, &attr)) {
         return static_cast<uintmax_t>(-1);
     }
+    ec.clear();
     return static_cast<uintmax_t>(attr.nFileSizeHigh) << (sizeof(attr.nFileSizeHigh) * 8) | attr.nFileSizeLow;
 #else
     struct ::stat fileStat;
@@ -3917,16 +3951,13 @@ GHC_INLINE uintmax_t hard_link_count(const path& p, std::error_code& ec) noexcep
     ec.clear();
 #ifdef GHC_OS_WINDOWS
     uintmax_t result = static_cast<uintmax_t>(-1);
-    std::shared_ptr<void> file(::CreateFileW(p.wstring().c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0), CloseHandle);
+    std::shared_ptr<void> file(
+        PROTECT_LASTERROR(::CreateFileW)(ec, p.wstring().c_str(), 0, (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE), nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr),
+        &CloseHandle);
     BY_HANDLE_FILE_INFORMATION inf;
-    if (file.get() == INVALID_HANDLE_VALUE) {
-        ec = detail::make_system_error();
-    }
-    else {
-        if (!::GetFileInformationByHandle(file.get(), &inf)) {
-            ec = detail::make_system_error();
-        }
-        else {
+    if (file.get() != INVALID_HANDLE_VALUE) {
+        if (PROTECT_LASTERROR(::GetFileInformationByHandle)(ec, file.get(), &inf)) {
+            ec.clear();
             result = inf.nNumberOfLinks;
         }
     }
@@ -4147,13 +4178,13 @@ GHC_INLINE void last_write_time(const path& p, file_time_type new_time, std::err
     ec.clear();
     auto d = new_time.time_since_epoch();
 #ifdef GHC_OS_WINDOWS
-    std::shared_ptr<void> file(::CreateFileW(p.wstring().c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL), ::CloseHandle);
+    std::shared_ptr<void> file(PROTECT_LASTERROR(::CreateFileW)(ec, p.wstring().c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr), ::CloseHandle);
     FILETIME ft;
     auto tt = std::chrono::duration_cast<std::chrono::microseconds>(d).count() * 10 + 116444736000000000;
     ft.dwLowDateTime = static_cast<DWORD>(tt);
     ft.dwHighDateTime = static_cast<DWORD>(tt >> 32);
-    if (!::SetFileTime(file.get(), 0, 0, &ft)) {
-        ec = detail::make_system_error();
+    if (PROTECT_LASTERROR(::SetFileTime)(ec, file.get(), nullptr, nullptr, &ft)) {
+        ec.clear();
     }
 #elif defined(GHC_OS_MACOS)
 #ifdef __MAC_OS_X_VERSION_MIN_REQUIRED
@@ -4236,10 +4267,11 @@ GHC_INLINE void permissions(const path& p, perms prms, perm_options opts, std::e
     }
 #ifdef GHC_OS_WINDOWS
 #ifdef __GNUC__
-    auto oldAttr = GetFileAttributesW(p.wstring().c_str());
+    auto oldAttr = PROTECT_LASTERROR(GetFileAttributesW)(ec, p.wstring().c_str());
     if (oldAttr != INVALID_FILE_ATTRIBUTES) {
         DWORD newAttr = ((prms & perms::owner_write) == perms::owner_write) ? oldAttr & ~(static_cast<DWORD>(FILE_ATTRIBUTE_READONLY)) : oldAttr | FILE_ATTRIBUTE_READONLY;
-        if (oldAttr == newAttr || SetFileAttributesW(p.wstring().c_str(), newAttr)) {
+        if (oldAttr == newAttr || PROTECT_LASTERROR(SetFileAttributesW)(ec, p.wstring().c_str(), newAttr)) {
+            ec.clear();
             return;
         }
     }
@@ -4341,23 +4373,26 @@ GHC_INLINE bool remove(const path& p, std::error_code& ec) noexcept
     ec.clear();
 #ifdef GHC_OS_WINDOWS
     std::wstring np = detail::fromUtf8<std::wstring>(p.u8string());
-    DWORD attr = GetFileAttributesW(np.c_str());
+    DWORD attr = PROTECT_LASTERROR(GetFileAttributesW)(ec, np.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES) {
-        auto error = ::GetLastError();
-        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+        if (ec.value() == ERROR_FILE_NOT_FOUND || ec.value() == ERROR_PATH_NOT_FOUND) {
+            ec.clear();
             return false;
         }
-        ec = detail::make_system_error(error);
+    }
+    else
+    {
+        ec.clear();
     }
     if (!ec) {
         if (attr & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!RemoveDirectoryW(np.c_str())) {
-                ec = detail::make_system_error();
+            if (PROTECT_LASTERROR(RemoveDirectoryW)(ec, np.c_str())) {
+                ec.clear();
             }
         }
         else {
-            if (!DeleteFileW(np.c_str())) {
-                ec = detail::make_system_error();
+            if (PROTECT_LASTERROR(DeleteFileW)(ec, np.c_str())) {
+                ec.clear();
             }
         }
     }
@@ -4446,8 +4481,8 @@ GHC_INLINE void rename(const path& from, const path& to, std::error_code& ec) no
     ec.clear();
 #ifdef GHC_OS_WINDOWS
     if (from != to) {
-        if (!MoveFileExW(detail::fromUtf8<std::wstring>(from.u8string()).c_str(), detail::fromUtf8<std::wstring>(to.u8string()).c_str(), (DWORD)MOVEFILE_REPLACE_EXISTING)) {
-            ec = detail::make_system_error();
+        if (PROTECT_LASTERROR(MoveFileExW)(ec, detail::fromUtf8<std::wstring>(from.u8string()).c_str(), detail::fromUtf8<std::wstring>(to.u8string()).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            ec.clear();
         }
     }
 #else
@@ -4484,12 +4519,12 @@ GHC_INLINE void resize_file(const path& p, uintmax_t size, std::error_code& ec) 
 #endif
         return;
     }
-    std::shared_ptr<void> file(CreateFileW(detail::fromUtf8<std::wstring>(p.u8string()).c_str(), GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL), CloseHandle);
-    if (file.get() == INVALID_HANDLE_VALUE) {
-        ec = detail::make_system_error();
-    }
-    else if (SetFilePointerEx(file.get(), lisize, NULL, FILE_BEGIN) == 0 || SetEndOfFile(file.get()) == 0) {
-        ec = detail::make_system_error();
+    std::shared_ptr<void> file(PROTECT_LASTERROR(CreateFileW)(ec, detail::fromUtf8<std::wstring>(p.u8string()).c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr), CloseHandle);
+    if (file.get() != INVALID_HANDLE_VALUE) {
+        ec.clear();
+        if (PROTECT_LASTERROR(SetFilePointerEx)(ec, file.get(), lisize, nullptr, FILE_BEGIN) != 0 && PROTECT_LASTERROR(SetEndOfFile)(ec,file.get()) != 0) {
+            ec.clear();        
+        }
     }
 #else
     if (::truncate(p.c_str(), static_cast<off_t>(size)) != 0) {
@@ -4517,10 +4552,11 @@ GHC_INLINE space_info space(const path& p, std::error_code& ec) noexcept
     ULARGE_INTEGER freeBytesAvailableToCaller = {{0, 0}};
     ULARGE_INTEGER totalNumberOfBytes = {{0, 0}};
     ULARGE_INTEGER totalNumberOfFreeBytes = {{0, 0}};
-    if (!GetDiskFreeSpaceExW(detail::fromUtf8<std::wstring>(p.u8string()).c_str(), &freeBytesAvailableToCaller, &totalNumberOfBytes, &totalNumberOfFreeBytes)) {
-        ec = detail::make_system_error();
+    if (!PROTECT_LASTERROR(GetDiskFreeSpaceExW)(ec, detail::fromUtf8<std::wstring>(p.u8string()).c_str(), &freeBytesAvailableToCaller, &totalNumberOfBytes, &totalNumberOfFreeBytes)) {
         return {static_cast<uintmax_t>(-1), static_cast<uintmax_t>(-1), static_cast<uintmax_t>(-1)};
     }
+    
+    ec.clear();
     return {static_cast<uintmax_t>(totalNumberOfBytes.QuadPart), static_cast<uintmax_t>(totalNumberOfFreeBytes.QuadPart), static_cast<uintmax_t>(freeBytesAvailableToCaller.QuadPart)};
 #else
     struct ::statvfs sfs;
@@ -4588,11 +4624,12 @@ GHC_INLINE path temp_directory_path(std::error_code& ec) noexcept
     ec.clear();
 #ifdef GHC_OS_WINDOWS
     wchar_t buffer[512];
-    auto rc = GetTempPathW(511, buffer);
+    auto rc = PROTECT_LASTERROR(GetTempPathW)(ec, 511, buffer);
     if (!rc || rc > 511) {
-        ec = detail::make_system_error();
+        
         return path();
     }
+    ec.clear();
     return path(std::wstring(buffer));
 #else
     static const char* temp_vars[] = {"TMPDIR", "TMP", "TEMP", "TEMPDIR", nullptr};
