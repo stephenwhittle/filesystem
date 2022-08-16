@@ -576,6 +576,7 @@ public:
     iterator end() const;
 
 private:
+    inline friend auto path_root_name_length(path& self) noexcept;
     using impl_value_type = value_type;
     using impl_string_type = std::basic_string<impl_value_type>;
     friend class directory_iterator;
@@ -2994,7 +2995,7 @@ GHC_INLINE void path::handle_prefixes()
 GHC_INLINE path::string_type::size_type path::root_name_length() const noexcept
 {
 #ifdef GHC_OS_CUSTOM
-    return detail::custom::path_root_name_length();
+    return detail::custom::path_root_name_length(*this);
 #else
 #ifdef GHC_OS_WINDOWS
     if (_path.length() >= _prefixLength + 2 && std::toupper(static_cast<unsigned char>(_path[_prefixLength])) >= 'A' && std::toupper(static_cast<unsigned char>(_path[_prefixLength])) <= 'Z' && _path[_prefixLength + 1] == ':') {
