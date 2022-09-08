@@ -367,6 +367,18 @@ bool has_executable_extension(const path& p);
 }
 #endif
 
+#ifdef GHC_OS_CUSTOM
+
+namespace detail
+{
+    namespace custom
+    {
+        class directory_iterator_impl;
+    }
+}
+
+#endif
+
 // [fs.class.path] class path
 class GHC_FS_API_CLASS path
 #if defined(GHC_OS_WINDOWS) && !defined(GHC_WIN_DISABLE_WSTRING_STORAGE_TYPE)
@@ -576,7 +588,7 @@ public:
     iterator end() const;
 
 private:
-    inline friend auto path_root_name_length(path& self) noexcept;
+    inline friend size_t path_root_name_length(const path& self) noexcept;
     using impl_value_type = value_type;
     using impl_string_type = std::basic_string<impl_value_type>;
     friend class directory_iterator;
@@ -896,6 +908,9 @@ public:
 
 private:
     friend class directory_iterator;
+    #ifdef GHC_OS_CUSTOM
+    friend class directory_iterator_impl;
+    #endif
 #ifdef GHC_WITH_EXCEPTIONS
     file_type status_file_type() const;
 #endif
@@ -969,7 +984,11 @@ public:
 
 private:
     friend class recursive_directory_iterator;
+    #ifdef GHC_OS_CUSTOM
+    using impl = class detail::custom::directory_iterator_impl;
+    #else
     class impl;
+    #endif
     std::shared_ptr<impl> _impl;
 };
 
@@ -1047,6 +1066,73 @@ private:
     };
     std::shared_ptr<recursive_directory_iterator_impl> _impl;
 };
+
+
+#ifdef GHC_OS_CUSTOM
+namespace detail
+{
+    namespace custom
+    {
+        inline void create_symlink(const path& target_name, const path& new_symlink, bool, std::error_code& ec);
+	    inline void create_hardlink(const path& target_name, const path& new_hardlink, std::error_code& ec);
+        
+        inline void last_write_time(const path& p, std::chrono::time_point<std::chrono::system_clock> new_time, std::error_code& ec) noexcept;
+
+	    template<typename T>
+	    inline file_status file_status_from_st_mode(T mode);
+
+	    inline path resolveSymlink(const path& p, std::error_code& ec);
+
+	    inline bool is_not_found_error(std::error_code& ec);
+	    inline file_status symlink_status_ex(const path& p, std::error_code& ec, uintmax_t* sz = nullptr,
+											    uintmax_t* nhl = nullptr, time_t* lwt = nullptr) noexcept;
+	    inline file_status status_ex(const path& p, std::error_code& ec, file_status* sls = nullptr,
+									    uintmax_t* sz = nullptr, uintmax_t* nhl = nullptr, time_t* lwt = nullptr,
+									    int recurse_count = 0) noexcept;
+
+	    inline path absolute(const path& p, std::error_code& ec);
+	    inline bool copy_file(const path& from, const path& to, copy_options options,
+							    std::error_code& ec) noexcept;
+	    inline path current_path(std::error_code& ec);
+	    inline void current_path(const path& p, std::error_code& ec) noexcept;
+	    inline bool equivalent(const path& p1, const path& p2, std::error_code& ec) noexcept;
+	    inline uintmax_t file_size(const path& p, std::error_code& ec) noexcept;
+	    inline uintmax_t hard_link_count(const path& p, std::error_code& ec) noexcept;
+
+	    inline bool remove(const path& p, std::error_code& ec) noexcept;
+	    inline void rename(const path& from, const path& to, std::error_code& ec) noexcept;
+	    inline void resize_file(const path& p, uintmax_t size, std::error_code& ec) noexcept;
+	    inline space_info space(const path& p, std::error_code& ec) noexcept;
+	    inline path temp_directory_path(std::error_code& ec) noexcept;
+
+	    inline bool create_directory(const path& p, const path& attributes, std::error_code& ec) noexcept;
+        inline void apply_permissions(const path& p, perms prms, perm_options opts, std::error_code& ec) noexcept;
+
+        class directory_iterator_impl
+        {
+            public:
+
+            virtual ~directory_iterator_impl(){};
+
+            virtual void increment(std::error_code& ec) = 0;
+            virtual class ghc::filesystem::directory_entry& get_directory_entry() = 0;
+            virtual class std::error_code& get_ec() = 0;
+
+            directory_entry _dir_entry;
+			std::error_code _ec;
+        };
+
+        inline directory_iterator_impl* create_directory_iterator_impl(const path& p, directory_options options);
+
+        
+    }
+}
+inline size_t path_root_name_length(const path& self) noexcept;
+#endif
+
+
+
+
 
 // [fs.rec.dir.itr.nonmembers] directory_iterator non-member functions
 GHC_FS_API recursive_directory_iterator begin(recursive_directory_iterator iter) noexcept;
@@ -2242,7 +2328,7 @@ GHC_INLINE bool is_not_found_error(std::error_code& ec)
 GHC_INLINE file_status symlink_status_ex(const path& p, std::error_code& ec, uintmax_t* sz = nullptr, uintmax_t* nhl = nullptr, time_t* lwt = nullptr) noexcept
 {
 #ifdef GHC_OS_CUSTOM
-    return detail::custom_symlink_status_ex(p, ec, sz, nhl, lwt);
+    return detail::custom::symlink_status_ex(p, ec, sz, nhl, lwt);
 #else
 #ifdef GHC_OS_WINDOWS
     file_status fs;
@@ -2366,7 +2452,7 @@ GHC_INLINE file_status status_ex(const path& p, std::error_code& ec, file_status
 }
 
 }  // namespace detail
-
+#ifndef GHC_OS_CUSTOM
 GHC_INLINE u8arguments::u8arguments(int& argc, char**& argv)
     : _argc(argc)
     , _argv(argv)
@@ -2397,6 +2483,7 @@ GHC_INLINE u8arguments::u8arguments(int& argc, char**& argv)
 #endif
 #endif
 }
+#endif
 
 //-----------------------------------------------------------------------------
 // [fs.path.construct] constructors and destructor
@@ -2995,7 +3082,7 @@ GHC_INLINE void path::handle_prefixes()
 GHC_INLINE path::string_type::size_type path::root_name_length() const noexcept
 {
 #ifdef GHC_OS_CUSTOM
-    return detail::custom::path_root_name_length(*this);
+    return path_root_name_length(*this);
 #else
 #ifdef GHC_OS_WINDOWS
     if (_path.length() >= _prefixLength + 2 && std::toupper(static_cast<unsigned char>(_path[_prefixLength])) >= 'A' && std::toupper(static_cast<unsigned char>(_path[_prefixLength])) <= 'Z' && _path[_prefixLength + 1] == ':') {
@@ -3608,7 +3695,7 @@ GHC_INLINE path absolute(const path& p, std::error_code& ec)
     ec = detail::make_system_error();
     return path();
 #else
-    path base = current_path(ec);
+    path base = current_path(ec);appl
     if (!ec) {
         if (p.empty()) {
             return base / p;
@@ -5749,13 +5836,21 @@ public:
 #endif
 // [fs.dir.itr.members] member functions
 GHC_INLINE directory_iterator::directory_iterator() noexcept
+#ifdef GHC_OS_CUSTOM
+    : _impl(detail::custom::create_directory_iterator_impl(path(), directory_options::none))
+#else
     : _impl(new impl(path(), directory_options::none))
+#endif
 {
 }
 
 #ifdef GHC_WITH_EXCEPTIONS
 GHC_INLINE directory_iterator::directory_iterator(const path& p)
+#ifdef GHC_OS_CUSTOM
+    : _impl(detail::custom::create_directory_iterator_impl(p, directory_options::none))
+#else
     : _impl(new impl(p, directory_options::none))
+#endif
 {
     if (_impl->_ec) {
         throw filesystem_error(detail::systemErrorText(_impl->_ec.value()), p, _impl->_ec);
@@ -5764,7 +5859,11 @@ GHC_INLINE directory_iterator::directory_iterator(const path& p)
 }
 
 GHC_INLINE directory_iterator::directory_iterator(const path& p, directory_options options)
+#ifdef GHC_OS_CUSTOM
+    : _impl(detail::custom::create_directory_iterator_impl(p, options))
+#else
     : _impl(new impl(p, options))
+#endif
 {
     if (_impl->_ec) {
         throw filesystem_error(detail::systemErrorText(_impl->_ec.value()), p, _impl->_ec);
@@ -5773,7 +5872,11 @@ GHC_INLINE directory_iterator::directory_iterator(const path& p, directory_optio
 #endif
 
 GHC_INLINE directory_iterator::directory_iterator(const path& p, std::error_code& ec) noexcept
+#ifdef GHC_OS_CUSTOM
+    : _impl(detail::custom::create_directory_iterator_impl(p, directory_options::none))
+#else
     : _impl(new impl(p, directory_options::none))
+#endif
 {
     if (_impl->_ec) {
         ec = _impl->_ec;
@@ -5781,7 +5884,11 @@ GHC_INLINE directory_iterator::directory_iterator(const path& p, std::error_code
 }
 
 GHC_INLINE directory_iterator::directory_iterator(const path& p, directory_options options, std::error_code& ec) noexcept
+#ifdef GHC_OS_CUSTOM
+    : _impl(detail::custom::create_directory_iterator_impl(p, options))
+#else
     : _impl(new impl(p, options))
+#endif
 {
     if (_impl->_ec) {
         ec = _impl->_ec;
