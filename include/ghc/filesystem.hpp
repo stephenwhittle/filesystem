@@ -3695,7 +3695,7 @@ GHC_INLINE path absolute(const path& p, std::error_code& ec)
     ec = detail::make_system_error();
     return path();
 #else
-    path base = current_path(ec);appl
+    path base = current_path(ec);
     if (!ec) {
         if (p.empty()) {
             return base / p;
